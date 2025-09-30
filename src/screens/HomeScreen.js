@@ -1,5 +1,5 @@
 // src/screens/HomeScreen.js
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   SafeAreaView,
   Text,
@@ -12,38 +12,97 @@ import {
 } from 'react-native';
 import Geolocation from '@react-native-community/geolocation';
 
-const THRESHOLD_METERS = 50;
-
-// Replace these with your own locations
+// example places
 const PLACES = [
-  { id: 'p1', label: 'iOS Sim Location',     lat: 37.785834,    lon: -122.406417 },
-  { id: 'p2', label: 'Sydney Opera',   lat: -33.856784, lon: 151.215297 },
-  { id: 'p3', label: 'UTS Building 11',  lat: -33.883869,   lon: 151.199111 },
+  { id: 'p1', label: 'iOS Sim Location', lat: 37.785834, lon: -122.406417 },
+  { id: 'p2', label: 'Sydney Opera',     lat: -33.856784, lon: 151.215297 },
+  { id: 'p3', label: 'UTS Building 11',  lat: -33.883869, lon: 151.199111 },
 ];
 
-
-// Haversine distance in meters
+// Uses the Haversine formula to calculate great-circle distance (in meters).
+// In this project it's used in two ways:
+//   1. To show the "true" distance between raw coordinates.
+//   2. To approximate a "geohash distance" by measuring between the decoded cell centers of two geohashes.
 const toRad = v => (v * Math.PI) / 180;
-function distanceMeters(lat1, lon1, lat2, lon2) {
-  const R = 6371000; // meters
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
   const a =
     Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-    Math.sin(dLon / 2) ** 2;
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
 }
 
+// pure JS geohash (encode + decode to center)
+// Base32 character set used in geohash
+const BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+const CHAR_MAP = Object.fromEntries([...BASE32].map((ch, i) => [ch, i]));
+
+function encodeGeohash(latitude, longitude, precision = 8) {
+  let idx = 0, bit = 0, evenBit = true, geohash = '';
+  let latMin = -90, latMax = 90;
+  let lonMin = -180, lonMax = 180;
+
+  while (geohash.length < precision) {
+    if (evenBit) {
+      const mid = (lonMin + lonMax) / 2;
+      if (longitude > mid) { idx = (idx << 1) + 1; lonMin = mid; }
+      else { idx = (idx << 1); lonMax = mid; }
+    } else {
+      const mid = (latMin + latMax) / 2;
+      if (latitude > mid) { idx = (idx << 1) + 1; latMin = mid; }
+      else { idx = (idx << 1); latMax = mid; }
+    }
+    evenBit = !evenBit;
+
+    if (++bit === 5) {
+      geohash += BASE32.charAt(idx);
+      bit = 0; idx = 0;
+    }
+  }
+  return geohash;
+}
+
+function decodeGeohashCenter(hash) {
+  let evenBit = true;
+  let latMin = -90, latMax = 90;
+  let lonMin = -180, lonMax = 180;
+
+  for (const ch of hash) {
+    const cd = CHAR_MAP[ch];
+    if (cd == null) throw new Error('Invalid geohash character: ' + ch);
+
+    for (let mask = 16; mask >= 1; mask >>= 1) {
+      if (evenBit) {
+        const mid = (lonMin + lonMax) / 2;
+        if (cd & mask) lonMin = mid; else lonMax = mid;
+      } else {
+        const mid = (latMin + latMax) / 2;
+        if (cd & mask) latMin = mid; else latMax = mid;
+      }
+      evenBit = !evenBit;
+    }
+  }
+  return { lat: (latMin + latMax) / 2, lon: (lonMin + lonMax) / 2 };
+}
+
 export default function HomeScreen() {
-  const [coords, setCoords] = useState(null);
+  const [coords, setCoords] = useState(null);     // {lat, lon, acc}
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
   const [selectedId, setSelectedId] = useState(null);
-  const [result, setResult] = useState(null); // { label, distance }
+  const [precision, setPrecision] = useState(8);  // change this and distance updates
+  const [userHash, setUserHash] = useState(null);
+  const [distanceM, setDistanceM] = useState(null); // geohash-based distance
+  const [trueDistanceM, setTrueDistanceM] = useState(null); // conputes true distance (for comparison with geohash-based)
 
-  const selectedPlace = PLACES.find(p => p.id === selectedId) || null;
+
+  const selectedPlace = useMemo(
+    () => PLACES.find(p => p.id === selectedId) || null,
+    [selectedId]
+  );
 
   const requestAndroidPermission = async () => {
     if (Platform.OS !== 'android') return true;
@@ -62,7 +121,8 @@ export default function HomeScreen() {
     setLoading(true);
     setError(null);
     setCoords(null);
-    setResult(null);
+    setUserHash(null);
+    setDistanceM(null);
 
     try {
       const ok = await requestAndroidPermission();
@@ -80,14 +140,6 @@ export default function HomeScreen() {
             acc: pos.coords.accuracy,
           };
           setCoords(c);
-
-          if (selectedPlace) {
-            const d = distanceMeters(c.lat, c.lon, selectedPlace.lat, selectedPlace.lon);
-            setResult({ label: selectedPlace.label, distance: d });
-          } else {
-            setResult({ label: null, distance: null });
-          }
-
           setLoading(false);
         },
         e => {
@@ -100,14 +152,41 @@ export default function HomeScreen() {
       setError(String(e));
       setLoading(false);
     }
-  }, [selectedPlace]);
+  }, []);
+
+  // Recompute geohash + distance whenever coords, selected place, or precision changes
+  useEffect(() => {
+    if (!coords) return;
+
+    const hash = encodeGeohash(coords.lat, coords.lon, precision);
+    setUserHash(hash);
+
+    if (selectedPlace) {
+      // geohash-based distance
+      const userCenter = decodeGeohashCenter(hash);
+      const targetHash = encodeGeohash(selectedPlace.lat, selectedPlace.lon, precision);
+      const targetCenter = decodeGeohashCenter(targetHash);
+      const dGeo = haversineMeters(userCenter.lat, userCenter.lon, targetCenter.lat, targetCenter.lon);
+      setDistanceM(dGeo);
+
+      // true distance (raw coords vs target coords)
+      const dTrue = haversineMeters(coords.lat, coords.lon, selectedPlace.lat, selectedPlace.lon);
+      setTrueDistanceM(dTrue);
+    } else {
+      setDistanceM(null);
+      setTrueDistanceM(null);
+    }
+  }, [coords, selectedPlace, precision]);
+
+  const cyclePrecision = () => setPrecision(p => (p >= 12 ? 5 : p + 1));
+  const fmtM = m => (m == null ? '—' : `${Math.round(m)} m`);
 
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="dark-content" />
-      <Text style={styles.title}>Press for geo location</Text>
+      <Text style={styles.title}>Geohash distance</Text>
 
-      {/* Target boxes */}
+      {/* place selector */}
       <View style={styles.boxRow}>
         {PLACES.map(place => {
           const selected = place.id === selectedId;
@@ -126,12 +205,18 @@ export default function HomeScreen() {
         })}
       </View>
 
-      {/* Get Location button */}
-      <TouchableOpacity style={styles.button} onPress={getLocation} disabled={loading}>
-        <Text style={styles.buttonText}>{loading ? 'Getting location…' : 'Get Location'}</Text>
-      </TouchableOpacity>
+      {/* controls */}
+      <View style={{ flexDirection: 'row', marginBottom: 12 }}>
+        <TouchableOpacity style={[styles.button, { marginRight: 8 }]} onPress={getLocation} disabled={loading}>
+          <Text style={styles.buttonText}>{loading ? 'Getting location…' : 'Get Location'}</Text>
+        </TouchableOpacity>
 
-      {/* Your coordinates */}
+        <TouchableOpacity style={[styles.button, { backgroundColor: '#333' }]} onPress={cyclePrecision} disabled={loading}>
+          <Text style={styles.buttonText}>Precision: {precision}</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* coords of device */}
       {coords && (
         <Text style={styles.coords}>
           Lat: {coords.lat.toFixed(6)}{'\n'}
@@ -140,32 +225,40 @@ export default function HomeScreen() {
         </Text>
       )}
 
-      {/* Result + target coordinates */}
-      <View style={styles.resultBox}>
-        {!selectedPlace ? (
-          <Text style={styles.resultText}>Select a target above to check distance.</Text>
-        ) : result && result.distance != null ? (
-          Math.round(result.distance) <= THRESHOLD_METERS ? (
-            <Text style={styles.resultText}>
-              ✅ You are within {THRESHOLD_METERS} m of <Text style={styles.resultBold}>{result.label}</Text>{' '}
-              ({Math.round(result.distance)} m).
+      {/* geohash + distance */}
+      {userHash && (
+        <View style={styles.resultBox}>
+          <Text style={styles.resultText}>
+            Your geohash ({precision}): <Text style={styles.resultBold}>{userHash}</Text>
+          </Text>
+
+
+          {!selectedPlace ? (
+            <Text style={[styles.resultText, { marginTop: 8 }]}>
+              Select a target above to see distance.
             </Text>
           ) : (
-            <Text style={styles.resultText}>
-              ❌ You are <Text style={styles.resultBold}>{Math.round(result.distance)} m</Text> away from{' '}
-              <Text style={styles.resultBold}>{result.label}</Text>.
-            </Text>
-          )
-        ) : (
-          <Text style={styles.resultText}>Tap “Get Location” to measure distance.</Text>
-        )}
+            <>
+              <Text style={[styles.resultText, { marginTop: 8 }]}>
+                Geohash (p={precision}):{' '}
+                <Text style={styles.resultBold}>
+                  {distanceM != null ? `${Math.round(distanceM)} m` : '—'}
+                </Text>
+              </Text>
 
-        {selectedPlace && (
-          <Text style={styles.targetCoords}>
-            Target ({selectedPlace.label}): {selectedPlace.lat.toFixed(6)}, {selectedPlace.lon.toFixed(6)}
-          </Text>
-        )}
-      </View>
+              <Text style={[styles.resultText, { marginTop: 4 }]}>
+                True distance (Haversine):{' '}
+                <Text style={styles.resultBold}>
+                  {trueDistanceM != null ? `${Math.round(trueDistanceM)} m` : '—'}
+                </Text>
+              </Text>
+            </>
+          )}
+
+
+
+        </View>
+      )}
 
       {error && <Text style={styles.error}>{error}</Text>}
     </SafeAreaView>
@@ -182,13 +275,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#fff',
   },
-  title: { fontSize: 24, fontWeight: '700', marginBottom: 16, textAlign: 'center' },
+  title: { fontSize: 22, fontWeight: '700', marginBottom: 16, textAlign: 'center' },
 
-  boxRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 24,
-  },
+  boxRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 24 },
   box: {
     width: BOX_SIZE,
     height: BOX_SIZE,
@@ -201,10 +290,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 8,
   },
-  boxSelected: {
-    backgroundColor: '#dbeafe', // light blue
-    borderColor: '#93c5fd',
-  },
+  boxSelected: { backgroundColor: '#dbeafe', borderColor: '#93c5fd' },
   boxLabel: { textAlign: 'center', fontWeight: '600', color: '#111827' },
   boxLabelSelected: { color: '#1e3a8a' },
 
